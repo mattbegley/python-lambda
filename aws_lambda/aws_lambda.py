@@ -1,32 +1,38 @@
 # -*- coding: utf-8 -*-
 from __future__ import print_function
 
-import hashlib
-import json
-import logging
 import os
 import sys
-import time
-from collections import defaultdict
-from imp import load_source
-from shutil import copy
-from shutil import copyfile
-from shutil import copystat
-from shutil import copytree
-from tempfile import mkdtemp
-
-import boto3
-import botocore
 import yaml
+import time
+import json
+import boto3
+import hashlib
+import logging
+import botocore
+import platform
 import subprocess
+from stat import ST_MODE
+from imp import load_source
+from tempfile import mkdtemp
+from collections import defaultdict
 
-from .helpers import archive
-from .helpers import get_environment_variable_value
-from .helpers import mkdir
-from .helpers import read
-from .helpers import timestamp
-from .helpers import LambdaContext
+from shutil import (
+    copy,
+    copyfile,
+    copystat,
+    copytree,
+    rmtree
+)
 
+from .helpers import (
+    read,
+    mkdir,
+    archive,
+    timestamp,
+    LambdaContext,
+    get_environment_variable_value
+)
 
 ARN_PREFIXES = {
     'cn-north-1': 'aws-cn',
@@ -120,6 +126,11 @@ def deploy(
     else:
         create_function(cfg, path_to_zip_file)
 
+    print('Cleaning up build from local filesystem')
+    dist_directory = cfg.get('dist_directory', 'dist')
+    path_to_dist = os.path.join(src, dist_directory)
+    rmtree(path_to_dist)
+
 
 def deploy_s3(
     src, requirements=None, local_package=None,
@@ -156,6 +167,7 @@ def deploy_s3(
                         s3_file=s3_file, preserve_vpc=preserve_vpc)
     else:
         create_function(cfg, path_to_zip_file, use_s3=use_s3, s3_file=s3_file)
+
 
 
 def upload(
@@ -268,6 +280,52 @@ def init(src, minimal=False):
         if not os.path.isdir(dest_path):
             copy(dest_path, src)
 
+def check_object_permissions(path):
+    # Fixes an issue when building on mac/linux, where local file permissions are inherited by aws lambda
+    # causing a permissions error to be thrown when aws lambda tries to execute service.py and read other
+    # objects in the build.
+
+    # Only required on Mac and Linux
+    if platform.system() in ('Darwin', 'Linux'):
+
+        def check(path):
+            current_octal_mode = int(oct(os.stat(path)[ST_MODE])[-3:])
+            user_octal_mode, group_octal_mode, others_octal_mode = [int(m) for m in str(current_octal_mode)]
+            
+            # Ensure we have both read and execute permissions on .py files
+            if os.path.isfile(path) and os.path.splitext(os.path.split(path)[1])[1] == '.py':
+                if group_octal_mode not in (5, 7):# 5 == read and execute, 7 == read, write and execute
+                    group_octal_mode = 5
+                if others_octal_mode not in (5, 7):# 5 == read and execute, 7 == read, write and execute
+                    others_octal_mode = 5
+
+                new_octal_mode = int(f'{user_octal_mode}{group_octal_mode}{others_octal_mode}')
+                if new_octal_mode != current_octal_mode:
+                    print(f'Changing permissions on \'{path}\' from octal mode {current_octal_mode} to {new_octal_mode}')
+                    os.chmod(path, new_octal_mode)
+
+            # Ensure we have read permissions on all other files
+            elif others_octal_mode < 4:
+                # 'Others' do not have read and execute permissions, grant this now
+                others_octal_mode = 4
+                new_octal_mode = int(f'{user_octal_mode}{group_octal_mode}{others_octal_mode}')
+                print(f'Changing permissions on \'{path}\' from octal mode {current_octal_mode} to {new_octal_mode}')
+                os.chmod(path, new_octal_mode)
+
+        if os.path.isfile(path):
+            # Check file has the appropriate permissions
+            check(path)
+        elif os.path.isdir(path):
+            # # Check directory itself has the appropriate permissions
+            # check(path)
+
+            # Check the contents of the directory have the appropriate permissions
+            for root, dirs, files in os.walk(path):
+                for d in dirs:
+                    check(os.path.join(root, d))
+                for f in files:
+                    check(os.path.join(root, f))
+
 
 def build(
     src, requirements=None, local_package=None,
@@ -336,16 +394,17 @@ def build(
 
     files = []
     for filename in os.listdir(src):
-        if os.path.isfile(filename):
+        file_path = os.path.join(src, filename)
+        if os.path.isfile(file_path):
             if filename == '.DS_Store':
                 continue
             if filename == config_file:
                 continue
             print('Bundling: %r' % filename)
-            files.append(os.path.join(src, filename))
-        elif os.path.isdir(filename) and filename in source_directories:
+            files.append(file_path)
+        elif os.path.isdir(file_path) and filename in source_directories:
             print('Bundling directory: %r' % filename)
-            files.append(os.path.join(src, filename))
+            files.append(file_path)
 
     # "cd" into `temp_path` directory.
     os.chdir(path_to_temp)
@@ -354,15 +413,23 @@ def build(
             _, filename = os.path.split(f)
 
             # Copy handler file into root of the packages folder.
-            copyfile(f, os.path.join(path_to_temp, filename))
-            copystat(f, os.path.join(path_to_temp, filename))
+            file_path = os.path.join(path_to_temp, filename)
+            copyfile(f, file_path)
+            copystat(f, file_path)
         elif os.path.isdir(f):
-            destination_folder = os.path.join(path_to_temp, f[len(src) + 1:])
+            destination_loc = f[len(src) + 1:] if not src.endswith('/') else f[len(src):]
+            destination_folder = os.path.join(path_to_temp, destination_loc)
             copytree(f, destination_folder)
+
+
+            
+    # Check the permissions on all objects in the build
+    check_object_permissions(path='./')
 
     # Zip them together into a single file.
     # TODO: Delete temp directory created once the archive has been compiled.
     path_to_zip_file = archive('./', path_to_dist, output_filename)
+
     return path_to_zip_file
 
 
